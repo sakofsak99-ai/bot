@@ -15,78 +15,81 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BufferedInputFile
+    BufferedInputFile,
 )
-# Configuration is supplied by the hosting platform environment variables.
-# No .env file or python-dotenv is used.
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9108382414:AAH2TqnCs3Kk2ukh6EWdFB4CE53pJ_1CUAs").strip()
-OWNER_ID_RAW = os.environ.get("OWNER_ID", "8321550731").strip()
+
+# Configuration comes only from Bothost environment variables.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
 DB_PATH = os.environ.get("DB_PATH", "richflow_crm.sqlite3").strip() or "richflow_crm.sqlite3"
 
-_missing = [name for name, value in (("BOT_TOKEN", BOT_TOKEN), ("OWNER_ID", OWNER_ID_RAW)) if not value]
+_missing = [key for key, value in (("BOT_TOKEN", BOT_TOKEN), ("OWNER_ID", OWNER_ID_RAW)) if not value]
 if _missing:
-    raise RuntimeError(
-        "Missing required environment variable(s): " + ", ".join(_missing)
-        + ". Add them in the Bothost environment variables settings."
-    )
+    raise RuntimeError("Не заданы переменные окружения: " + ", ".join(_missing))
 try:
     OWNER_ID = int(OWNER_ID_RAW)
 except ValueError as exc:
-    raise RuntimeError("OWNER_ID must be a numeric Telegram user ID.") from exc
+    raise RuntimeError("OWNER_ID должен быть числовым Telegram ID.") from exc
 if OWNER_ID <= 0:
-    raise RuntimeError("OWNER_ID must be a positive numeric Telegram user ID.")
-PAGE_SIZE = 5
-SEARCH_CACHE = {}
+    raise RuntimeError("OWNER_ID должен быть положительным числом.")
 
-STATUSES = [
-    "Новый", "В работе", "Ожидает ответа", "Заинтересован",
-    "На оформлении", "Успешно", "Отказ", "Не выходит на связь", "Архив"
-]
-FIELDS = [
-    ("name", "Имя"),
-    ("telegram", "Telegram"),
-    ("phone", "Телефон"),
-    ("has_ip", "ИП"),
-    ("city", "Город"),
-    ("source", "Источник"),
-    ("status", "Статус"),
-    ("bank", "Банк"),
-    ("last_contact", "Последний контакт"),
-    ("next_contact", "Следующий контакт"),
-    ("comment", "Комментарий"),
-]
-FIELD_MAP = dict(FIELDS)
+PAGE_SIZE = 8
+SEARCH_CACHE = {}
+STATUSES = ["Новый", "В работе", "Ожидает ответа", "Заинтересован", "Успешно", "Отказ", "Архив"]
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
+    """Create the four-column schema and safely migrate the previous schema."""
     with db() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='leads'"
+        ).fetchone()
+        if not exists:
+            conn.execute("""
+                CREATE TABLE leads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username_tg TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'Новый',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            return
+
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()]
+        if columns == ["id", "username_tg", "status", "created_at"]:
+            return
+
+        # Preserve IDs, Telegram usernames, statuses and creation timestamps.
+        old_cols = set(columns)
+        username_expr = "telegram" if "telegram" in old_cols else ("username_tg" if "username_tg" in old_cols else "''")
+        status_expr = "status" if "status" in old_cols else "'Новый'"
+        created_expr = "created_at" if "created_at" in old_cols else "CURRENT_TIMESTAMP"
+        conn.execute("ALTER TABLE leads RENAME TO leads_old_migration")
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS leads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            telegram TEXT DEFAULT '',
-            phone TEXT DEFAULT '',
-            has_ip TEXT DEFAULT '',
-            city TEXT DEFAULT '',
-            source TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'Новый',
-            bank TEXT DEFAULT '',
-            last_contact TEXT DEFAULT '',
-            next_contact TEXT DEFAULT '',
-            comment TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        )
+            CREATE TABLE leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username_tg TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Новый',
+                created_at TEXT NOT NULL
+            )
         """)
+        conn.execute(f"""
+            INSERT INTO leads (id, username_tg, status, created_at)
+            SELECT id, COALESCE({username_expr}, ''), COALESCE({status_expr}, 'Новый'),
+                   COALESCE({created_expr}, CURRENT_TIMESTAMP)
+            FROM leads_old_migration
+        """)
+        conn.execute("DROP TABLE leads_old_migration")
 
 
 def is_owner(user_id: int) -> bool:
-    return OWNER_ID != 0 and user_id == OWNER_ID
+    return user_id == OWNER_ID
 
 
 def main_kb():
@@ -95,69 +98,57 @@ def main_kb():
          InlineKeyboardButton(text="➕ Добавить лида", callback_data="add")],
         [InlineKeyboardButton(text="🔎 Поиск", callback_data="search"),
          InlineKeyboardButton(text="🏷 По статусам", callback_data="statuses")],
-        [InlineKeyboardButton(text="⏰ Контакты на сегодня", callback_data="today"),
-         InlineKeyboardButton(text="📤 Экспорт CSV", callback_data="export")],
+        [InlineKeyboardButton(text="📤 Экспорт CSV", callback_data="export")],
     ])
 
 
-def lead_keyboard(lead_id: int):
+def lead_kb(lead_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:{lead_id}"),
+        [InlineKeyboardButton(text="✏️ Изменить username", callback_data=f"edit:{lead_id}"),
          InlineKeyboardButton(text="🔄 Статус", callback_data=f"setstatus:{lead_id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{lead_id}"),
          InlineKeyboardButton(text="⬅️ К списку", callback_data="list:0")],
     ])
 
 
-def get_lead(lead_id):
+def get_lead(lead_id: int):
     with db() as conn:
-        return conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+        return conn.execute("SELECT id, username_tg, status, created_at FROM leads WHERE id=?", (lead_id,)).fetchone()
 
 
 def lead_text(row):
-    def val(k):
-        return escape(row[k] or "—")
     return (
-        f"<b>Лид #{row['id']} · {val('name')}</b>\n"
-        f"Статус: <b>{val('status')}</b>\n"
-        f"Telegram: {val('telegram')}\n"
-        f"Телефон: {val('phone')}\n"
-        f"ИП: {val('has_ip')}\n"
-        f"Город: {val('city')}\n"
-        f"Источник: {val('source')}\n"
-        f"Банк: {val('bank')}\n"
-        f"Последний контакт: {val('last_contact')}\n"
-        f"Следующий контакт: {val('next_contact')}\n"
-        f"Комментарий: {val('comment')}"
+        f"<b>Лид #{row['id']}</b>\n"
+        f"Telegram: {escape(row['username_tg'] or '—')}\n"
+        f"Статус: <b>{escape(row['status'])}</b>\n"
+        f"Создан: {escape(row['created_at'])}"
     )
 
 
-def list_leads(page=0, status=None, search=None):
+def list_leads(page=0, status=None, query=None):
     where, params = [], []
     if status:
         where.append("status=?")
         params.append(status)
-    if search:
-        where.append("(name LIKE ? OR telegram LIKE ? OR phone LIKE ?)")
-        params.extend([f"%{search}%"] * 3)
+    if query:
+        where.append("username_tg LIKE ?")
+        params.append(f"%{query}%")
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     with db() as conn:
         total = conn.execute("SELECT COUNT(*) FROM leads" + clause, params).fetchone()[0]
         rows = conn.execute(
-            "SELECT id,name,status,city,next_contact FROM leads" + clause +
+            "SELECT id, username_tg, status, created_at FROM leads" + clause +
             " ORDER BY id DESC LIMIT ? OFFSET ?",
-            params + [PAGE_SIZE, page * PAGE_SIZE]
+            params + [PAGE_SIZE, page * PAGE_SIZE],
         ).fetchall()
     return rows, total
 
 
 def list_kb(rows, page, total, prefix="list"):
     buttons = []
-    for r in rows:
-        label = f"#{r['id']} {r['name']} · {r['status']}"
-        if r["city"]:
-            label += f" · {r['city']}"
-        buttons.append([InlineKeyboardButton(text=label[:60], callback_data=f"lead:{r['id']}")])
+    for row in rows:
+        label = f"#{row['id']} @{row['username_tg']} · {row['status']}" if row['username_tg'] else f"#{row['id']} · {row['status']}"
+        buttons.append([InlineKeyboardButton(text=label[:60], callback_data=f"lead:{row['id']}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{prefix}:{page-1}"))
@@ -170,94 +161,41 @@ def list_kb(rows, page, total, prefix="list"):
 
 
 class AddLead(StatesGroup):
-    name = State()
-    telegram = State()
-    phone = State()
-    has_ip = State()
-    city = State()
-    source = State()
-    bank = State()
-    last_contact = State()
-    next_contact = State()
-    comment = State()
+    username_tg = State()
 
 
 class EditLead(StatesGroup):
-    value = State()
+    username_tg = State()
 
 
 class SearchLead(StatesGroup):
     query = State()
 
 
-async def ask_next(message: Message, state: FSMContext, field_index: int):
-    prompts = [
-        ("name", "Имя лида (обязательно):"),
-        ("telegram", "Telegram username или ссылка (можно «-»):"),
-        ("phone", "Телефон (или «-»):"),
-        ("has_ip", "Есть ИП? Напиши «Да», «Нет» или «-»:"),
-        ("city", "Город (или «-»):"),
-        ("source", "Источник заявки (или «-»):"),
-        ("bank", "Банк / предложение (или «-»):"),
-        ("last_contact", "Дата последнего контакта (например, 22.11.2026 или «-»):"),
-        ("next_contact", "Дата следующего контакта (например, 24.11.2026 или «-»):"),
-        ("comment", "Комментарий (или «-»):"),
-    ]
-    key, prompt = prompts[field_index]
-    await state.set_state(getattr(AddLead, key).state)
-    await message.answer(prompt)
-
-
-async def add_value(message: Message, state: FSMContext, key: str, next_index: int):
-    value = message.text.strip()
-    if value == "-":
-        value = ""
-    await state.update_data(**{key: value})
-    if next_index < 10:
-        await ask_next(message, state, next_index)
-    else:
-        data = await state.get_data()
-        with db() as conn:
-            cur = conn.execute("""
-                INSERT INTO leads
-                (name,telegram,phone,has_ip,city,source,bank,last_contact,next_contact,comment,status,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                data.get("name", ""), data.get("telegram", ""), data.get("phone", ""),
-                data.get("has_ip", ""), data.get("city", ""), data.get("source", ""),
-                data.get("bank", ""), data.get("last_contact", ""), data.get("next_contact", ""),
-                data.get("comment", ""), "Новый", datetime.now().strftime("%d.%m.%Y %H:%M")
-            ))
-            lead_id = cur.lastrowid
-        await state.clear()
-        row = get_lead(lead_id)
-        await message.answer("✅ Лид добавлен.\n\n" + lead_text(row), reply_markup=lead_keyboard(lead_id))
-
-
-async def start_add(message: Message, state: FSMContext):
-    await state.clear()
-    await ask_next(message, state, 0)
-
-
-async def owner_guard_message(message: Message):
-    if not is_owner(message.from_user.id):
+async def owner_message(message: Message) -> bool:
+    if not message.from_user or not is_owner(message.from_user.id):
         await message.answer("⛔ Доступ закрыт.")
         return False
     return True
 
 
-async def owner_guard_callback(call: CallbackQuery):
+async def owner_callback(call: CallbackQuery) -> bool:
     if not is_owner(call.from_user.id):
         await call.answer("Доступ закрыт", show_alert=True)
         return False
     return True
 
 
+def clean_username(value: str) -> str:
+    value = value.strip()
+    if value.startswith("https://t.me/"):
+        value = value.removeprefix("https://t.me/").split("/")[0].split("?")[0]
+    elif value.startswith("http://t.me/"):
+        value = value.removeprefix("http://t.me/").split("/")[0].split("?")[0]
+    return value.lstrip("@").strip()
+
+
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Не задан BOT_TOKEN в файле .env")
-    if OWNER_ID == 0:
-        raise RuntimeError("Не задан OWNER_ID в файле .env")
     init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
@@ -265,7 +203,7 @@ async def main():
     @dp.message(CommandStart())
     @dp.message(Command("menu"))
     async def cmd_start(message: Message):
-        if await owner_guard_message(message):
+        if await owner_message(message):
             await message.answer("Добро пожаловать в <b>RICHFLOW CRM</b>.\nВыбери действие:", reply_markup=main_kb())
 
     @dp.message(Command("id"))
@@ -274,186 +212,203 @@ async def main():
 
     @dp.callback_query(F.data == "menu")
     async def menu(call: CallbackQuery):
-        if await owner_guard_callback(call):
+        if await owner_callback(call):
             await call.message.edit_text("Главное меню RICHFLOW CRM:", reply_markup=main_kb())
             await call.answer()
 
     @dp.callback_query(F.data == "add")
-    async def add(call: CallbackQuery, state: FSMContext):
-        if await owner_guard_callback(call):
-            await call.message.answer("➕ Добавление нового лида.")
-            await start_add(call.message, state)
-            await call.answer()
+    async def add_start(call: CallbackQuery, state: FSMContext):
+        if not await owner_callback(call):
+            return
+        await state.clear()
+        await state.set_state(AddLead.username_tg)
+        await call.message.answer("➕ Введи Telegram username лида (например, @username или ссылку t.me/username):")
+        await call.answer()
 
-    @dp.message(AddLead.name)
-    async def a_name(m: Message, s: FSMContext): await add_value(m, s, "name", 1)
-    @dp.message(AddLead.telegram)
-    async def a_tg(m: Message, s: FSMContext): await add_value(m, s, "telegram", 2)
-    @dp.message(AddLead.phone)
-    async def a_phone(m: Message, s: FSMContext): await add_value(m, s, "phone", 3)
-    @dp.message(AddLead.has_ip)
-    async def a_ip(m: Message, s: FSMContext): await add_value(m, s, "has_ip", 4)
-    @dp.message(AddLead.city)
-    async def a_city(m: Message, s: FSMContext): await add_value(m, s, "city", 5)
-    @dp.message(AddLead.source)
-    async def a_source(m: Message, s: FSMContext): await add_value(m, s, "source", 6)
-    @dp.message(AddLead.bank)
-    async def a_bank(m: Message, s: FSMContext): await add_value(m, s, "bank", 7)
-    @dp.message(AddLead.last_contact)
-    async def a_last(m: Message, s: FSMContext): await add_value(m, s, "last_contact", 8)
-    @dp.message(AddLead.next_contact)
-    async def a_next(m: Message, s: FSMContext): await add_value(m, s, "next_contact", 9)
-    @dp.message(AddLead.comment)
-    async def a_comment(m: Message, s: FSMContext): await add_value(m, s, "comment", 10)
+    @dp.message(AddLead.username_tg)
+    async def add_username(message: Message, state: FSMContext):
+        if not await owner_message(message):
+            return
+        if not message.text:
+            await message.answer("Отправь username текстом, например @username.")
+            return
+        username = clean_username(message.text)
+        if not username:
+            await message.answer("Username пустой. Введи @username или отправь '-' если username неизвестен.")
+            return
+        if username == "-":
+            username = ""
+        created_at = datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S")
+        with db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO leads (username_tg, status, created_at) VALUES (?, ?, ?)",
+                (username, "Новый", created_at),
+            )
+            lead_id = cursor.lastrowid
+        await state.clear()
+        row = get_lead(lead_id)
+        await message.answer("✅ Лид добавлен.\n\n" + lead_text(row), reply_markup=lead_kb(lead_id))
 
     @dp.callback_query(F.data.startswith("list:"))
     async def show_list(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        page = int(call.data.split(":")[1])
+        if not await owner_callback(call):
+            return
+        page = int(call.data.split(":", 1)[1])
         rows, total = list_leads(page)
         if not rows:
             await call.message.edit_text("Пока лидов нет. Нажми «Добавить лида».", reply_markup=main_kb())
         else:
-            text = f"<b>Все лиды</b> · {total} всего · страница {page+1}\nВыбери запись:"
-            await call.message.edit_text(text, reply_markup=list_kb(rows, page, total))
+            await call.message.edit_text(f"<b>Все лиды</b> · {total} всего · страница {page+1}", reply_markup=list_kb(rows, page, total))
         await call.answer()
 
     @dp.callback_query(F.data.startswith("lead:"))
     async def show_lead(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        lead_id = int(call.data.split(":")[1])
+        if not await owner_callback(call):
+            return
+        lead_id = int(call.data.split(":", 1)[1])
         row = get_lead(lead_id)
         if row:
-            await call.message.edit_text(lead_text(row), reply_markup=lead_keyboard(lead_id))
+            await call.message.edit_text(lead_text(row), reply_markup=lead_kb(lead_id))
         else:
             await call.message.edit_text("Лид не найден.", reply_markup=main_kb())
         await call.answer()
 
     @dp.callback_query(F.data.startswith("edit:"))
-    async def edit_menu(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        lead_id = int(call.data.split(":")[1])
-        row = get_lead(lead_id)
-        if not row:
-            await call.answer("Лид не найден", show_alert=True); return
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=label, callback_data=f"field:{lead_id}:{key}")]
-            for key, label in FIELDS if key != "status"
-        ] + [[InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"lead:{lead_id}")]])
-        await call.message.edit_text("Какое поле изменить?", reply_markup=kb)
+    async def edit_start(call: CallbackQuery, state: FSMContext):
+        if not await owner_callback(call):
+            return
+        lead_id = int(call.data.split(":", 1)[1])
+        if not get_lead(lead_id):
+            await call.answer("Лид не найден", show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(edit_id=lead_id)
+        await state.set_state(EditLead.username_tg)
+        await call.message.answer("Введи новый Telegram username (или '-' чтобы очистить):")
         await call.answer()
 
-    @dp.callback_query(F.data.startswith("field:"))
-    async def edit_field(call: CallbackQuery, state: FSMContext):
-        if not await owner_guard_callback(call): return
-        _, lid, key = call.data.split(":")
-        await state.update_data(edit_id=int(lid), edit_key=key)
-        await state.set_state(EditLead.value)
-        await call.message.answer(f"Введи новое значение для поля «{FIELD_MAP[key]}». Для очистки отправь дефис -")
-        await call.answer()
-
-    @dp.message(EditLead.value)
-    async def save_field(message: Message, state: FSMContext):
-        if not await owner_guard_message(message): return
+    @dp.message(EditLead.username_tg)
+    async def edit_username(message: Message, state: FSMContext):
+        if not await owner_message(message):
+            return
+        if not message.text:
+            await message.answer("Отправь username текстом.")
+            return
         data = await state.get_data()
-        value = message.text.strip()
-        if value == "-": value = ""
+        username = clean_username(message.text)
+        if username == "-":
+            username = ""
         with db() as conn:
-            conn.execute(f"UPDATE leads SET {data['edit_key']}=? WHERE id=?", (value, data["edit_id"]))
+            conn.execute("UPDATE leads SET username_tg=? WHERE id=?", (username, data["edit_id"]))
         lead_id = data["edit_id"]
         await state.clear()
-        row = get_lead(lead_id)
-        await message.answer("✅ Изменения сохранены.\n\n" + lead_text(row), reply_markup=lead_keyboard(lead_id))
+        await message.answer("✅ Username обновлён.\n\n" + lead_text(get_lead(lead_id)), reply_markup=lead_kb(lead_id))
 
     @dp.callback_query(F.data.startswith("setstatus:"))
     async def status_menu(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        lid = int(call.data.split(":")[1])
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=s, callback_data=f"status:{lid}:{i}")]
-            for i, s in enumerate(STATUSES)
-        ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"lead:{lid}")]])
-        await call.message.edit_text("Выбери новый статус:", reply_markup=kb)
+        if not await owner_callback(call):
+            return
+        lead_id = int(call.data.split(":", 1)[1])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=status, callback_data=f"status:{lead_id}:{index}")]
+            for index, status in enumerate(STATUSES)
+        ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"lead:{lead_id}")]])
+        await call.message.edit_text("Выбери новый статус:", reply_markup=keyboard)
         await call.answer()
 
     @dp.callback_query(F.data.startswith("status:"))
     async def set_status(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        _, lid, idx = call.data.split(":")
-        status = STATUSES[int(idx)]
+        if not await owner_callback(call):
+            return
+        _, lead_id_raw, index_raw = call.data.split(":")
+        lead_id, index = int(lead_id_raw), int(index_raw)
+        if index < 0 or index >= len(STATUSES):
+            await call.answer("Неизвестный статус", show_alert=True)
+            return
         with db() as conn:
-            conn.execute("UPDATE leads SET status=? WHERE id=?", (status, int(lid)))
-        row = get_lead(int(lid))
-        await call.message.edit_text("✅ Статус обновлён.\n\n" + lead_text(row), reply_markup=lead_keyboard(int(lid)))
+            conn.execute("UPDATE leads SET status=? WHERE id=?", (STATUSES[index], lead_id))
+        row = get_lead(lead_id)
+        if row:
+            await call.message.edit_text("✅ Статус обновлён.\n\n" + lead_text(row), reply_markup=lead_kb(lead_id))
         await call.answer()
 
     @dp.callback_query(F.data.startswith("delete:"))
     async def delete_confirm(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        lid = int(call.data.split(":")[1])
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Да, удалить", callback_data=f"delok:{lid}"),
-            InlineKeyboardButton(text="Отмена", callback_data=f"lead:{lid}")
+        if not await owner_callback(call):
+            return
+        lead_id = int(call.data.split(":", 1)[1])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Да, удалить", callback_data=f"delok:{lead_id}"),
+            InlineKeyboardButton(text="Отмена", callback_data=f"lead:{lead_id}"),
         ]])
-        await call.message.edit_text(f"Точно удалить лида #{lid}? Это действие нельзя отменить.", reply_markup=kb)
+        await call.message.edit_text(f"Точно удалить лида #{lead_id}?", reply_markup=keyboard)
         await call.answer()
 
     @dp.callback_query(F.data.startswith("delok:"))
     async def delete_lead(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        lid = int(call.data.split(":")[1])
+        if not await owner_callback(call):
+            return
+        lead_id = int(call.data.split(":", 1)[1])
         with db() as conn:
-            conn.execute("DELETE FROM leads WHERE id=?", (lid,))
+            conn.execute("DELETE FROM leads WHERE id=?", (lead_id,))
         await call.message.edit_text("🗑 Лид удалён.", reply_markup=main_kb())
         await call.answer()
 
     @dp.callback_query(F.data == "statuses")
     async def statuses(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=s, callback_data=f"filter:{i}")]
-            for i, s in enumerate(STATUSES)
+        if not await owner_callback(call):
+            return
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=status, callback_data=f"filter:{index}")]
+            for index, status in enumerate(STATUSES)
         ] + [[InlineKeyboardButton(text="🏠 Меню", callback_data="menu")]])
-        await call.message.edit_text("Выбери статус для фильтрации:", reply_markup=kb)
+        await call.message.edit_text("Выбери статус:", reply_markup=keyboard)
         await call.answer()
 
     @dp.callback_query(F.data.startswith("filter:"))
     async def filter_status(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        status = STATUSES[int(call.data.split(":")[1])]
+        if not await owner_callback(call):
+            return
+        index = int(call.data.split(":", 1)[1])
+        status = STATUSES[index]
         rows, total = list_leads(0, status=status)
         await call.message.edit_text(
             f"<b>Статус: {escape(status)}</b> · {total} лидов",
-            reply_markup=list_kb(rows, 0, total, prefix=f"filtered{int(call.data.split(':')[1])}") if rows else main_kb()
+            reply_markup=list_kb(rows, 0, total, prefix=f"filtered{index}") if rows else main_kb(),
         )
         await call.answer()
 
     @dp.callback_query(F.data.startswith("filtered"))
     async def filtered_page(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        status_index, page = call.data.replace("filtered", "").split(":")
-        status = STATUSES[int(status_index)]
-        rows, total = list_leads(int(page), status=status)
+        if not await owner_callback(call):
+            return
+        status_index, page_raw = call.data.replace("filtered", "", 1).split(":")
+        status_index, page = int(status_index), int(page_raw)
+        status = STATUSES[status_index]
+        rows, total = list_leads(page, status=status)
         await call.message.edit_text(
             f"<b>Статус: {escape(status)}</b> · {total} лидов",
-            reply_markup=list_kb(rows, int(page), total, prefix=f"filtered{status_index}")
+            reply_markup=list_kb(rows, page, total, prefix=f"filtered{status_index}"),
         )
         await call.answer()
 
     @dp.callback_query(F.data == "search")
     async def search_start(call: CallbackQuery, state: FSMContext):
-        if not await owner_guard_callback(call): return
+        if not await owner_callback(call):
+            return
+        await state.clear()
         await state.set_state(SearchLead.query)
-        await call.message.answer("Введи имя, Telegram username или телефон для поиска:")
+        await call.message.answer("Введи Telegram username для поиска:")
         await call.answer()
 
     @dp.message(SearchLead.query)
     async def search_results(message: Message, state: FSMContext):
-        if not await owner_guard_message(message): return
-        query = message.text.strip()
+        if not await owner_message(message):
+            return
+        query = clean_username(message.text or "")
         await state.clear()
         SEARCH_CACHE[message.from_user.id] = query
-        rows, total = list_leads(0, search=query)
+        rows, total = list_leads(0, query=query)
         if rows:
             await message.answer(f"Результаты поиска: {total}", reply_markup=list_kb(rows, 0, total, prefix="searchpage"))
         else:
@@ -461,60 +416,45 @@ async def main():
 
     @dp.callback_query(F.data.startswith("searchpage:"))
     async def search_page(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
+        if not await owner_callback(call):
+            return
         query = SEARCH_CACHE.get(call.from_user.id)
-        if not query:
+        if query is None:
             await call.answer("Повтори поиск, пожалуйста.", show_alert=True)
             return
-        page = int(call.data.split(":")[1])
-        rows, total = list_leads(page, search=query)
+        page = int(call.data.split(":", 1)[1])
+        rows, total = list_leads(page, query=query)
         await call.message.edit_text(
             f"<b>Результаты поиска: {escape(query)}</b> · {total}",
-            reply_markup=list_kb(rows, page, total, prefix="searchpage")
+            reply_markup=list_kb(rows, page, total, prefix="searchpage"),
         )
-        await call.answer()
-
-    @dp.callback_query(F.data == "today")
-    async def today_contacts(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
-        today = datetime.now().strftime("%d.%m.%Y")
-        with db() as conn:
-            rows = conn.execute(
-                "SELECT id,name,status,city,next_contact FROM leads WHERE next_contact=? ORDER BY id DESC",
-                (today,)
-            ).fetchall()
-        if rows:
-            await call.message.edit_text(
-                f"<b>Контакты на сегодня · {today}</b>",
-                reply_markup=list_kb(rows, 0, len(rows))
-            )
-        else:
-            await call.message.edit_text(f"На сегодня ({today}) контактов не запланировано.", reply_markup=main_kb())
         await call.answer()
 
     @dp.callback_query(F.data == "export")
     async def export_csv(call: CallbackQuery):
-        if not await owner_guard_callback(call): return
+        if not await owner_callback(call):
+            return
         with db() as conn:
-            rows = conn.execute("SELECT * FROM leads ORDER BY id").fetchall()
+            rows = conn.execute("SELECT id, username_tg, status, created_at FROM leads ORDER BY id").fetchall()
         output = io.StringIO()
         writer = csv.writer(output)
-        headers = ["ID"] + [label for _, label in FIELDS] + ["Создан"]
-        writer.writerow(headers)
-        for r in rows:
-            writer.writerow([r["id"]] + [r[k] for k, _ in FIELDS] + [r["created_at"]])
-        data = output.getvalue().encode("utf-8-sig")
-        file = BufferedInputFile(data, filename="richflow_leads.csv")
+        writer.writerow(["id", "username_tg", "status", "created_at"])
+        for row in rows:
+            writer.writerow([row["id"], row["username_tg"], row["status"], row["created_at"]])
+        file = BufferedInputFile(output.getvalue().encode("utf-8-sig"), filename="richflow_leads.csv")
         await call.message.answer_document(file, caption=f"Экспорт RICHFLOW CRM · {len(rows)} лидов")
         await call.answer()
 
     @dp.message()
     async def fallback(message: Message):
-        if await owner_guard_message(message):
+        if await owner_message(message):
             await message.answer("Используй меню бота: /menu", reply_markup=main_kb())
 
-    print(f"[RICHFLOW] Starting polling; PID={os.getpid()}; OWNER_ID configured; DB_PATH={DB_PATH}", flush=True)
-    await dp.start_polling(bot)
+    print(f"[RICHFLOW] Starting polling; PID={os.getpid()}; DB_PATH={DB_PATH}", flush=True)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
