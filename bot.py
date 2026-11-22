@@ -19,8 +19,8 @@ from aiogram.types import (
 )
 
 # Configuration comes only from Bothost environment variables.
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9108382414:AAH2TqnCs3Kk2ukh6EWdFB4CE53pJ_1CUAs").strip()
+OWNER_ID_RAW = os.environ.get("OWNER_ID", "8321550731").strip()
 DB_PATH = os.environ.get("DB_PATH", "richflow_crm.sqlite3").strip() or "richflow_crm.sqlite3"
 
 _missing = [key for key, value in (("BOT_TOKEN", BOT_TOKEN), ("OWNER_ID", OWNER_ID_RAW)) if not value]
